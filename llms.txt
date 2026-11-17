@@ -1,0 +1,2 @@
+# physkernel
+> Zero-allocation real-time physical-AI sensor fusion, anytime-valid e-process safety cutoff, MPC world-model rollout, and closed-loop SRE controller in Zig 0.15.2.
