@@ -1,2 +1,9 @@
 # physkernel
-> Zero-allocation real-time physical-AI sensor fusion, anytime-valid e-process safety cutoff, MPC world-model rollout, and closed-loop SRE controller in Zig 0.15.2.
+> Allocation-free sensor ring buffers, a CUSUM-style vibration detector, a candidate-trajectory selector and a service-health controller, in Zig 0.16. Prototype: the E-STOP is not calibrated.
+
+- `RtFusionKernel`: comptime-sized IMU/position ring buffers, Goertzel power, Welford baseline, SAFE/WARN/E_STOP detector. Not anytime-valid: on pure noise E_STOP fires in 54% of 1-second runs (#2).
+- `rolloutPlan`: picks the cheapest non-colliding sequence among caller-supplied candidates on a point mass. Not MPC (#3).
+- `SreController`: p99 / error-rate thresholds to none, scale_out, canary_rollback, page.
+- `physkernel bench`: stepImu ~180 ns on M2 Max; rollout figure is optimised away (#3).
+
+README.md is the source of truth, including measured numbers with hardware and commit.
