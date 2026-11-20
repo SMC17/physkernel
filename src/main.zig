@@ -31,16 +31,21 @@ pub fn main(init: std.process.Init) !void {
         const cands = [_][]const world_sim.ControlCmd{ &c0, &c1 };
         const t2 = std.Io.Clock.awake.now(io);
         i = 0;
-        var w_sink: usize = 0;
+        var w_sink: f64 = 0;
         while (i < 10_000) : (i += 1) {
-            w_sink +%= world_sim.rolloutPlan(start, goal, &obs, &cands, 1.0, 0.2).safe_candidates;
+            // Vary the start each iteration and hide it from the optimiser, so the work
+            // cannot be hoisted out of the loop (it was, and the bench printed 0 ns).
+            var s0 = start;
+            s0.pos.y = @as(f64, @floatFromInt(i % 7)) * 1e-3;
+            std.mem.doNotOptimizeAway(&s0);
+            w_sink += world_sim.rolloutPlan(s0, goal, &obs, &cands, 1.0, 0.2).best_cost;
         }
         std.mem.doNotOptimizeAway(w_sink);
         const t3 = std.Io.Clock.awake.now(io);
         const rollout_ns: i96 = @divTrunc(t2.durationTo(t3).nanoseconds, 10_000);
 
         var buf: [160]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "{{\"rt_fusion_ns_per_tick\":{d},\"mpc_rollout_ns\":{d}}}\n", .{ rt_ns, rollout_ns });
+        const msg = try std.fmt.bufPrint(&buf, "{{\"rt_fusion_ns_per_tick\":{d},\"rollout_ns\":{d}}}\n", .{ rt_ns, rollout_ns });
         try stdout.writeStreamingAll(io, msg);
         return;
     }
@@ -81,7 +86,7 @@ pub fn main(init: std.process.Init) !void {
 
     try stdout.writeStreamingAll(
         io,
-        "physkernel — Zero-Alloc Physical-AI Sensor Fusion, Safety E-Stop & MPC World-Model Rollout\n\nUsage:\n  physkernel bench\n  physkernel stream   (reads CSV ts_ns,accel_z,gyro_z from stdin, emits JSONL)\n",
+        "physkernel — allocation-free sensor buffers, a CUSUM e-detector E-STOP, candidate-trajectory selection\n\nUsage:\n  physkernel bench\n  physkernel stream   (reads CSV ts_ns,accel_z,gyro_z from stdin, emits JSONL)\n",
     );
 }
 

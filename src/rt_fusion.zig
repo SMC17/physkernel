@@ -1,12 +1,21 @@
 const std = @import("std");
 
-/// Hard-real-time, zero-allocation physical-AI / edge sensor-fusion & safety kernel.
-/// Designed for 1kHz+ deterministic control loops (drones, robotics, industrial telemetry)
-/// with zero GC/heap calls after initialization:
-/// - Fixed-capacity ring buffers for asynchronous multi-rate sensors
-/// - Zero-alloc inline `asof` temporal alignment
-/// - Online Goertzel resonant-frequency energy + Welford variance
-/// - Anytime-valid sequential e-value safety cutoff (`safe` / `warn` / `e_stop`)
+/// Allocation-free sensor ring buffers and a mean-shift detector for a control loop.
+/// - Fixed-capacity ring buffers for IMU samples and position fixes, sized at comptime.
+/// - As-of lookup of the latest position fix (linear scan of the fix buffer).
+/// - Goertzel power at one frequency, and a Welford baseline learned during warm-up.
+/// - A CUSUM e-detector over the standardised vertical acceleration (`safe` / `warn` / `e_stop`).
+///
+/// The detector, and what its thresholds mean:
+/// each step multiplies in the e-value e_t = cosh(mu * z_t) * exp(-mu^2 / 2). That is the
+/// likelihood ratio of a symmetric shift of +/- mu standard deviations against no shift, and
+/// E[e_t] = 1 exactly when z_t ~ N(0, 1). The statistic L_t = max(0, L_{t-1} + log e_t) is the
+/// CUSUM e-detector (Shin, Ramdas and Rinaldo, "E-detectors", 2023). Under the no-shift
+/// hypothesis, its mean time to a false alarm at threshold c is at least c steps. A threshold
+/// is therefore an average-run-length bound, not a per-run error rate.
+/// The bound assumes z_t ~ N(0, 1). The mean and variance are estimated from the warm-up
+/// samples, so the bound is approximate, and it fails if the noise is not Gaussian or not
+/// independent.
 pub const SafetyState = enum(u8) {
     safe,
     warn,
@@ -35,6 +44,13 @@ pub const FusedFrame = struct {
     safety: SafetyState,
 };
 
+/// log e for e = cosh(mu z) exp(-mu^2/2), computed without overflow for large |z|.
+pub fn logMixtureE(z: f64, mu: f64) f64 {
+    const a = @abs(mu * z);
+    // log cosh(a) = a + log1p(exp(-2a)) - log 2
+    return a + std.math.log1p(@exp(-2.0 * a)) - std.math.ln2 - 0.5 * mu * mu;
+}
+
 pub fn RtFusionKernel(comptime imu_cap: usize, comptime spatial_cap: usize) type {
     return struct {
         const Self = @This();
@@ -52,13 +68,18 @@ pub fn RtFusionKernel(comptime imu_cap: usize, comptime spatial_cap: usize) type
         mean: f64 = 0.0,
         m2: f64 = 0.0,
 
-        // Anytime-valid e-process accumulator (tests H0: nominal baseline vs H1: anomalous vibration)
+        // CUSUM e-detector statistic, in log space (see the file comment).
         log_e_value: f64 = 0.0,
         safety: SafetyState = .safe,
 
-        // Safety thresholds
-        warn_e_threshold: f64 = 20.0, // alpha <= 0.05
-        estop_e_threshold: f64 = 1000.0, // alpha <= 0.001
+        /// Samples used to learn the baseline mean and variance before detection starts.
+        warm_up: u64 = 256,
+        /// Shift size, in standard deviations, that the detector is tuned to.
+        shift_sigmas: f64 = 3.0,
+        /// Thresholds on the e-detector. Under no shift the mean steps to cross them are at least
+        /// these values: 1e5 steps is about 100 s at 1 kHz, and 1e9 steps about 11.6 days.
+        warn_e_threshold: f64 = 1e5,
+        estop_e_threshold: f64 = 1e9,
         target_freq_hz: f64 = 120.0,
         sample_rate_hz: f64 = 1000.0,
 
@@ -118,7 +139,7 @@ pub fn RtFusionKernel(comptime imu_cap: usize, comptime spatial_cap: usize) type
             return q1 * q1 + q2 * q2 - q1 * q2 * coeff;
         }
 
-        /// Deterministic 1kHz control-loop step. Zero allocations.
+        /// One control-loop step. No allocation; cost is measured by `physkernel bench`.
         pub fn stepImu(self: *Self, sample: ImuSample) FusedFrame {
             const idx = (self.imu_head + self.imu_len) % imu_cap;
             if (self.imu_len == imu_cap) {
@@ -128,28 +149,21 @@ pub fn RtFusionKernel(comptime imu_cap: usize, comptime spatial_cap: usize) type
             }
             self.imu_buf[idx] = sample;
 
-            // Update Welford online stats during warm-up or nominal operation
+            // Learn the baseline (Welford) during warm-up only.
             self.count += 1;
-            const delta = sample.accel_z - self.mean;
-            if (self.count <= 64) {
+            if (self.count <= self.warm_up) {
+                const delta = sample.accel_z - self.mean;
                 self.mean += delta / @as(f64, @floatFromInt(self.count));
-                const delta2 = sample.accel_z - self.mean;
-                self.m2 += delta * delta2;
+                self.m2 += delta * (sample.accel_z - self.mean);
             }
 
-            const sigma2 = if (self.count > 2) @max(1e-6, self.m2 / @as(f64, @floatFromInt(@min(self.count, 64) - 1))) else 1.0;
-
-            // Mixture sequential probability ratio test (e-process) for shift >= 3*sigma
-            if (self.count > 64 and self.safety != .e_stop) {
+            if (self.count > self.warm_up and self.safety != .e_stop) {
+                const sigma2 = @max(1e-12, self.m2 / @as(f64, @floatFromInt(self.warm_up - 1)));
                 const z = (sample.accel_z - self.mean) / @sqrt(sigma2);
-                const mu_alt = 3.0;
-                // Likelihood ratio step for N(mu_alt, 1) vs N(0, 1) on |z|
-                const lr_log = (@abs(z) * mu_alt) - 0.5 * mu_alt * mu_alt;
-                self.log_e_value = @max(0.0, self.log_e_value + lr_log);
-                const e_val = @exp(@min(self.log_e_value, 40.0));
-                if (e_val >= self.estop_e_threshold) {
-                    self.safety = .e_stop;
-                } else if (e_val >= self.warn_e_threshold) {
+                self.log_e_value = @max(0.0, self.log_e_value + logMixtureE(z, self.shift_sigmas));
+                if (self.log_e_value >= @log(self.estop_e_threshold)) {
+                    self.safety = .e_stop; // latches
+                } else if (self.log_e_value >= @log(self.warn_e_threshold)) {
                     self.safety = .warn;
                 } else {
                     self.safety = .safe;
@@ -171,15 +185,15 @@ pub fn RtFusionKernel(comptime imu_cap: usize, comptime spatial_cap: usize) type
     };
 }
 
-test "RtFusionKernel zero-alloc async fusion, Goertzel resonance, and anytime-valid E_STOP" {
+test "RtFusionKernel fusion, Goertzel resonance, and E_STOP on a severe vibration" {
     var rt = RtFusionKernel(128, 16).init(120.0, 1000.0);
 
     rt.pushSpatial(.{ .ts_ns = 1_000_000, .h3_cell = 0x8928308280fffff, .speed_mps = 12.5 });
     rt.pushSpatial(.{ .ts_ns = 2_000_000, .h3_cell = 0x8928308280bffff, .speed_mps = 13.0 });
 
-    // Nominal 64-sample warmup around 9.81 m/s^2 with tiny noise
+    // Nominal warm-up (256 samples) around 9.81 m/s^2 with small noise
     var i: usize = 0;
-    while (i < 64) : (i += 1) {
+    while (i < 256) : (i += 1) {
         const noise: f64 = if ((i & 1) == 0) 0.02 else -0.02;
         const f = rt.stepImu(.{
             .ts_ns = @intCast(1_500_000 + i * 1_000),
@@ -207,4 +221,48 @@ test "RtFusionKernel zero-alloc async fusion, Goertzel resonance, and anytime-va
     }
     try std.testing.expect(tripped);
     try std.testing.expect(rt.goertzelPower(64) > 100.0);
+}
+
+test "logMixtureE is a valid e-value increment: E[exp(.)] = 1 under N(0,1)" {
+    // Trapezoid rule on [-12, 12] with the standard normal density.
+    var acc: f64 = 0;
+    const h = 1e-3;
+    var x: f64 = -12.0;
+    while (x <= 12.0) : (x += h) {
+        acc += @exp(logMixtureE(x, 3.0)) * @exp(-0.5 * x * x) / @sqrt(2.0 * std.math.pi) * h;
+    }
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), acc, 1e-6);
+    try std.testing.expect(std.math.isFinite(logMixtureE(1e6, 3.0)));
+}
+
+fn runNoise(seed: u64, steps: usize, shift_at: ?usize, shift: f64) struct { estop_at: ?usize, warned: bool } {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+    var k = RtFusionKernel(256, 4).init(120.0, 1000.0);
+    var warned = false;
+    var t: usize = 0;
+    while (t < 256 + steps) : (t += 1) {
+        const mean_shift: f64 = if (shift_at) |s| (if (t >= 256 + s) shift else 0.0) else 0.0;
+        const f = k.stepImu(.{ .ts_ns = @intCast(t * 1_000_000), .accel_z = 9.81 + (r.floatNorm(f64) + mean_shift) * 0.05, .gyro_z = 0 });
+        if (f.safety == .warn) warned = true;
+        if (f.safety == .e_stop) return .{ .estop_at = t - 256, .warned = true };
+    }
+    return .{ .estop_at = null, .warned = warned };
+}
+
+test "regression #2: no false E_STOP on pure noise; fast E_STOP on a 3-sigma shift" {
+    // 500 runs x 1,000 steps of N(0, sigma) noise. The old detector stopped in 54% of runs.
+    var false_stops: usize = 0;
+    var seed: u64 = 1;
+    while (seed <= 500) : (seed += 1) {
+        if (runNoise(seed, 1000, null, 0).estop_at != null) false_stops += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), false_stops);
+
+    // A sustained 3-sigma shift starting at step 100 is stopped within 25 steps.
+    seed = 1;
+    while (seed <= 100) : (seed += 1) {
+        const at = runNoise(seed, 1000, 100, 3.0).estop_at orelse return error.MissedShift;
+        try std.testing.expect(at >= 100 and at < 125);
+    }
 }

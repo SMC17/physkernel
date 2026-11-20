@@ -1,9 +1,13 @@
 const std = @import("std");
 
-/// Autonomous Closed-Loop SRE & Drift-Driven Rollback Kernel.
-/// Evaluates live service telemetry (latency, error rate, token cost) with an
-/// anytime-valid CUSUM / e-process detector and cooldown hysteresis to issue
-/// bounded, non-oscillating remediation actions.
+/// Service-health controller: two cumulative detectors and a cooldown.
+/// - Latency: one-sided CUSUM on p99 above 1.25x baseline; at 2.5 it returns `shed_load`.
+/// - Errors: a CUSUM over a Bernoulli log-likelihood ratio, fed with "error rate above 2x
+///   baseline". At e >= 20 it returns `canary_rollback`.
+/// The thresholds are heuristics. The error detector is not anytime-valid, because the
+/// probability of "rate above 2x baseline" under normal operation is not `baseline_err`, so
+/// its increments are not e-values. `quarantine_tenant` is defined but never returned, and
+/// `cost_per_req` is read by nothing.
 pub const RemediationAction = enum(u8) {
     none,
     shed_load,
@@ -36,11 +40,11 @@ pub const SreController = struct {
     }
 
     pub fn ingest(self: *SreController, s: TelemetrySample) RemediationAction {
-        // One-sided CUSUM on p99 latency spike (>1.5x baseline)
+        // One-sided CUSUM on p99 latency above 1.25x baseline
         const lat_excess = (s.p99_ms - self.baseline_p99_ms * 1.25) / @max(1.0, self.baseline_p99_ms);
         self.cusum_lat = @max(0.0, self.cusum_lat + lat_excess);
 
-        // Anytime-valid e-process on error rate doubling
+        // CUSUM over a Bernoulli log-likelihood ratio on "error rate above 2x baseline" (heuristic)
         const p0 = @max(0.001, self.baseline_err);
         const p1 = @min(0.95, p0 * 4.0);
         const lr = if (s.error_rate > p0 * 2.0) @log(p1 / p0) else @log((1.0 - p1) / (1.0 - p0));

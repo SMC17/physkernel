@@ -1,8 +1,10 @@
 const std = @import("std");
 
-/// Deterministic Fixed-Timestep Physical-AI World-Model & MPC Trajectory Rollout Engine.
-/// Zero heap allocations: simulates `K` candidate control sequences over `H` steps,
-/// checks obstacle-clearance invariants at every sub-step, and selects the lowest-cost safe plan.
+/// Candidate-trajectory selection on a 2-D point mass, with no heap use.
+/// Simulates each caller-supplied control sequence (semi-implicit Euler), rejects any whose
+/// straight-line path between consecutive steps comes within `radius + margin` of an obstacle,
+/// and returns the cheapest survivor (control effort + squared distance to goal).
+/// This chooses among candidates; it does not optimise them, so it is not MPC.
 pub const Vec2 = struct {
     x: f64,
     y: f64,
@@ -13,6 +15,16 @@ pub const Vec2 = struct {
         return dx * dx + dy * dy;
     }
 };
+
+/// Squared distance from point `c` to the segment `a`-`b`.
+pub fn segmentDistSq(a: Vec2, b: Vec2, c: Vec2) f64 {
+    const abx = b.x - a.x;
+    const aby = b.y - a.y;
+    const len2 = abx * abx + aby * aby;
+    if (len2 == 0) return Vec2.distSq(a, c);
+    const t = std.math.clamp(((c.x - a.x) * abx + (c.y - a.y) * aby) / len2, 0.0, 1.0);
+    return Vec2.distSq(.{ .x = a.x + t * abx, .y = a.y + t * aby }, c);
+}
 
 pub const Obstacle = struct {
     pos: Vec2,
@@ -53,6 +65,7 @@ pub fn rolloutPlan(
         var cost: f64 = 0.0;
 
         for (traj) |cmd| {
+            const prev = st.pos;
             st.vel.x += cmd.ax * dt;
             st.vel.y += cmd.ay * dt;
             st.pos.x += st.vel.x * dt;
@@ -60,7 +73,8 @@ pub fn rolloutPlan(
 
             for (obstacles) |obs| {
                 const min_r = obs.radius + safety_margin;
-                if (Vec2.distSq(st.pos, obs.pos) < min_r * min_r) {
+                // Check the whole step, not only where it ends: a fast step can jump over an obstacle.
+                if (segmentDistSq(prev, st.pos, obs.pos) < min_r * min_r) {
                     safe = false;
                     break;
                 }
@@ -101,4 +115,16 @@ test "world_sim prunes colliding trajectory and picks minimum-cost safe rollout"
 
     try std.testing.expectEqual(@as(usize, 1), res.safe_candidates);
     try std.testing.expectEqual(@as(?usize, 1), res.best_idx);
+}
+
+test "regression #3: a step that jumps over an obstacle is a collision" {
+    const start = State2D{ .pos = .{ .x = 0, .y = 0 }, .vel = .{ .x = 0, .y = 0 } };
+    const obs = [_]Obstacle{.{ .pos = .{ .x = 5, .y = 0 }, .radius = 1.5 }};
+    // One step of a = 20 moves the point from x = 0 to x = 20, straight through the obstacle.
+    // Both endpoints are clear, so an endpoint-only check accepts it.
+    const fast = [_]ControlCmd{.{ .ax = 20.0, .ay = 0.0 }};
+    const cands = [_][]const ControlCmd{&fast};
+    const res = rolloutPlan(start, .{ .x = 20, .y = 0 }, &obs, &cands, 1.0, 0.0);
+    try std.testing.expectEqual(@as(usize, 0), res.safe_candidates);
+    try std.testing.expectEqual(@as(?usize, null), res.best_idx);
 }
