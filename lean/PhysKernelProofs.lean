@@ -13,8 +13,8 @@ inductive SafetyState where
   | e_stop
   deriving DecidableEq, Repr
 
-def warnThreshold : Nat := 20
-def estopThreshold : Nat := 1000
+def warnThreshold : Nat := 100000
+def estopThreshold : Nat := 1000000000
 
 def stepSafety (s : SafetyState) (eVal : Nat) : SafetyState :=
   match s with
